@@ -1,5 +1,3 @@
-"""File and folder creation, file transfer operations."""
-
 import http.client as http
 import os
 import json
@@ -9,26 +7,18 @@ from collections import OrderedDict
 import logging
 from urllib.parse import quote_plus
 from requests import Response
-
-try:
-    from requests_toolbelt import MultipartEncoder
-except ImportError:
-    from acdcli.bundled.encoder import MultipartEncoder
+from requests_toolbelt import MultipartEncoder
 
 from .common import *
 
-FS_RW_CHUNK_SZ = 1024 * 128
-
 PARTIAL_SUFFIX = '.__incomplete'
-CHUNK_SIZE = 500 * 1024 ** 2  # basically arbitrary
-CHUNK_MAX_RETRY = 5
-CONSECUTIVE_DL_LIMIT = CHUNK_SIZE
+"""suffix (file ending) for incomplete files"""
 
 logger = logging.getLogger(__name__)
 
 
 class _TeeBufferedReader(object):
-    """Creates proxy buffered reader object that allows callbacks on read operations."""
+    """Proxy buffered reader object that allows callbacks on read operations."""
 
     def __init__(self, file: io.BufferedReader, callbacks: list = None):
         self._file = file
@@ -41,7 +31,7 @@ class _TeeBufferedReader(object):
             return getattr(self._file, item)
 
     def read(self, ln=-1):
-        ln = ln if ln in (0, -1) else FS_RW_CHUNK_SZ
+        #ln = ln if ln in (0, -1) else FS_RW_CHUNK_SZ
         chunk = self._file.read(ln)
         for callback in self._callbacks or []:
             callback(chunk)
@@ -58,32 +48,17 @@ def _get_mimetype(file_name: str = '') -> str:
     return mt if mt else 'application/octet-stream'
 
 
-def _multipart_stream(metadata: dict, stream, boundary: str, read_callbacks=None):
-    """Generator for chunked multipart/form-data file upload from stream input.
-    :param metadata: file info, leave empty for overwrite
-    :param stream: readable object
-    """
-
-    if metadata:
-        yield str.encode('--%s\r\nContent-Disposition: form-data; '
-                         'name="metadata"\r\n\r\n' % boundary +
-                         '%s\r\n' % json.dumps(metadata))
-    yield str.encode('--%s\r\n' % boundary) + \
-        b'Content-Disposition: form-data; name="content"; filename="foo"\r\n' + \
-        b'Content-Type: application/octet-stream\r\n\r\n'
-    while True:
-        f = stream.read(FS_RW_CHUNK_SZ)
-        if f:
-            for cb in read_callbacks or []:
-                cb(f)
-            yield f
-        else:
-            break
-    yield str.encode('\r\n--%s--\r\n' % boundary +
-                     'multipart/form-data; boundary=%s' % boundary)
-
+def _stream_is_empty(stream) -> bool:
+    try:
+        return not stream.peek(1)
+    except AttributeError:
+        logger.debug('Stream does not support peeking, upload will fail if stream does '
+                     'not contain at least one byte.')
+        return False
 
 class ContentMixin(object):
+    """Implements content portion of the ACD API."""
+
     def create_folder(self, name: str, parent=None) -> dict:
         body = {'kind': 'FOLDER', 'name': name}
         if parent:
@@ -123,6 +98,10 @@ class ContentMixin(object):
         return r.json()
 
     def clear_file(self, node_id: str) -> dict:
+        """Clears a file's content by overwriting it with an empty BytesIO.
+
+        :param node_id: valid file node ID"""
+
         m = MultipartEncoder(fields={('content', (' ', io.BytesIO(), _get_mimetype()))})
 
         r = self.BOReq.put(self.content_url + 'nodes/' + node_id + '/content', params={},
@@ -161,8 +140,38 @@ class ContentMixin(object):
             raise RequestError(r.status_code, r.text)
         return r.json()
 
+    def _multipart_stream(self, metadata: dict, stream, boundary: str, read_callbacks=None):
+        """Generator for chunked multipart/form-data file upload from stream input.
+
+        :param metadata: file info, leave empty for overwrite
+        :param stream: readable object"""
+
+        if metadata:
+            yield str.encode('--%s\r\nContent-Disposition: form-data; '
+                             'name="metadata"\r\n\r\n' % boundary +
+                             '%s\r\n' % json.dumps(metadata))
+        yield str.encode('--%s\r\n' % boundary) + \
+              b'Content-Disposition: form-data; name="content"; filename="foo"\r\n' + \
+              b'Content-Type: application/octet-stream\r\n\r\n'
+        while True:
+            f = stream.read(self._conf.getint('transfer', 'fs_chunk_size'))
+            if f:
+                for cb in read_callbacks or []:
+                    cb(f)
+                yield f
+            else:
+                break
+        yield str.encode('\r\n--%s--\r\n' % boundary +
+                         'multipart/form-data; boundary=%s' % boundary)
+
     def upload_stream(self, stream, file_name: str, parent: str = None,
                       read_callbacks=None, deduplication=False) -> dict:
+        """:param stream: readable object
+        :param parent: parent node id, defaults to root node if None"""
+
+        if _stream_is_empty(stream):
+            return self.create_file(file_name, parent)
+
         params = {} if deduplication else {'suppress': 'deduplication'}
 
         metadata = {'kind': 'FILE', 'name': file_name}
@@ -174,7 +183,7 @@ class ContentMixin(object):
 
         ok_codes = [http.CREATED]
         r = self.BOReq.post(self.content_url + 'nodes', params=params,
-                            data=_multipart_stream(metadata, stream, boundary, read_callbacks),
+                            data=self._multipart_stream(metadata, stream, boundary, read_callbacks),
                             acc_codes=ok_codes,
                             headers={'Content-Type': 'multipart/form-data; boundary=%s'
                                                      % boundary})
@@ -184,7 +193,7 @@ class ContentMixin(object):
         return r.json()
 
     def overwrite_file(self, node_id: str, file_name: str,
-                       read_callbacks=None, deduplication=False) -> dict:
+                       read_callbacks: list = None, deduplication=False) -> dict:
         params = {} if deduplication else {'suppress': 'deduplication'}
 
         basename = os.path.basename(file_name)
@@ -202,13 +211,20 @@ class ContentMixin(object):
 
         return r.json()
 
-    def overwrite_stream(self, stream, node_id, read_callbacks=None) -> dict:
+    def overwrite_stream(self, stream, node_id: str, read_callbacks: list = None) -> dict:
+        """Overwrite content of node with ID *node_id* with content of *stream*.
+
+        :param stream: readable object"""
+
+        if _stream_is_empty(stream):
+            return self.clear_file(node_id)
+
         metadata = {}
         import uuid
         boundary = uuid.uuid4().hex
 
         r = self.BOReq.put(self.content_url + 'nodes/' + node_id + '/content',
-                           data=_multipart_stream(metadata, stream, boundary, read_callbacks),
+                           data=self._multipart_stream(metadata, stream, boundary, read_callbacks),
                            headers={'Content-Type': 'multipart/form-data; boundary=%s'
                                                     % boundary})
 
@@ -217,16 +233,18 @@ class ContentMixin(object):
         return r.json()
 
     def download_file(self, node_id: str, basename: str, dirname: str = None, **kwargs):
-        """ Deals with download preparation, download with :func:`chunked_download` and finish.
+        """Deals with download preparation, download with :func:`chunked_download` and finish.
         Calls callbacks while fast forwarding through incomplete file (if existent).
         Will not check for existing file prior to download and overwrite existing file on finish.
-        :param dirname: a valid local directory name, or CWD if None
+
+        :param dirname: a valid local directory name, or cwd if None
         :param basename: a valid file name
-        kwargs:
-        length: the total length of the file
-        write_callbacks (list[function]): passed on to :func:`chunked_download`
-        resume (bool=True): whether to resume if partial file exists
-        """
+        :param kwargs: \
+         - length: the total length of the file
+         - write_callbacks (list[function]): passed on to :func:`chunked_download`
+         - resume (bool=True): whether to resume if partial file exists"""
+
+        chunk_sz = self._conf.getint('transfer', 'fs_chunk_size')
 
         dl_path = basename
         if dirname:
@@ -238,13 +256,13 @@ class ContentMixin(object):
         resume = kwargs.get('resume', True)
         if resume and os.path.isfile(part_path):
             with open(part_path, 'ab') as f:
-                trunc_pos = os.path.getsize(part_path) - 1 - FS_RW_CHUNK_SZ
+                trunc_pos = os.path.getsize(part_path) - 1 - chunk_sz
                 f.truncate(trunc_pos if trunc_pos >= 0 else 0)
 
             write_callbacks = kwargs.get('write_callbacks')
             if write_callbacks:
                 with open(part_path, 'rb') as f:
-                    for chunk in iter(lambda: f.read(FS_RW_CHUNK_SZ), b''):
+                    for chunk in iter(lambda: f.read(chunk_sz), b''):
                         for rcb in write_callbacks:
                             rcb(chunk)
 
@@ -258,7 +276,7 @@ class ContentMixin(object):
         f.close()
         if length > 0 and pos < length:
             raise RequestError(RequestError.CODE.INCOMPLETE_RESULT,
-                               '[acd_cli] download incomplete.')
+                               '[acd_api] download incomplete.')
 
         if os.path.isfile(dl_path):
             logger.info('Deleting existing file "%s".' % dl_path)
@@ -267,7 +285,7 @@ class ContentMixin(object):
 
     @catch_conn_exception
     def chunked_download(self, node_id: str, file: io.BufferedWriter, **kwargs):
-        """Keyword args:
+        """:param kwargs:
         offset (int): byte offset -- start byte for ranged request
         length (int): total file length[!], equal to end + 1
         write_callbacks (list[function])
@@ -279,15 +297,17 @@ class ContentMixin(object):
         chunk_start = kwargs.get('offset', 0)
         length = kwargs.get('length', 100 * 1024 ** 4)
 
+        dl_chunk_sz = self._conf.getint('transfer', 'dl_chunk_size')
+
         retries = 0
         while chunk_start < length:
-            chunk_end = chunk_start + CHUNK_SIZE - 1
+            chunk_end = chunk_start + dl_chunk_sz - 1
             if chunk_end >= length:
                 chunk_end = length - 1
 
-            if retries >= CHUNK_MAX_RETRY:
+            if retries >= self._conf.getint('transfer', 'chunk_retries'):
                 raise RequestError(RequestError.CODE.FAILED_SUBREQUEST,
-                                   '[acd_cli] Downloading chunk failed multiple times.')
+                                   '[acd_api] Downloading chunk failed multiple times.')
             r = self.BOReq.get(self.content_url + 'nodes/' + node_id + '/content', stream=True,
                                acc_codes=ok_codes,
                                headers={'Range': 'bytes=%d-%d' % (chunk_start, chunk_end)})
@@ -295,6 +315,7 @@ class ContentMixin(object):
             logger.debug('Range %d-%d' % (chunk_start, chunk_end))
             # this should only happen at the end of unknown-length downloads
             if r.status_code == http.REQUESTED_RANGE_NOT_SATISFIABLE:
+                r.close()
                 logger.debug('Invalid byte range requested %d-%d' % (chunk_start, chunk_end))
                 break
             if r.status_code not in ok_codes:
@@ -305,7 +326,7 @@ class ContentMixin(object):
 
             curr_ln = 0
             try:
-                for chunk in r.iter_content(chunk_size=FS_RW_CHUNK_SZ):
+                for chunk in r.iter_content(chunk_size=self._conf.getint('transfer', 'fs_chunk_size')):
                     if chunk:  # filter out keep-alive new chunks
                         file.write(chunk)
                         file.flush()
@@ -315,7 +336,7 @@ class ContentMixin(object):
             finally:
                 r.close()
 
-            chunk_start += CHUNK_SIZE
+            chunk_start += dl_chunk_sz
             retries = 0
 
         return
@@ -335,15 +356,18 @@ class ContentMixin(object):
 
         return r
 
-    def download_chunk(self, node_id: str, offset: int, length: int, **kwargs):
-        """:param length: the length of the download chunk"""
+    def download_chunk(self, node_id: str, offset: int, length: int, **kwargs) -> bytearray:
+        """Load a file chunk into memory.
+
+        :param length: the length of the download chunk"""
+
         r = self.response_chunk(node_id, offset, length, **kwargs)
         if not r:
             return
 
         buffer = bytearray()
         try:
-            for chunk in r.iter_content(chunk_size=FS_RW_CHUNK_SZ):
+            for chunk in r.iter_content(chunk_size=self._conf.getint('transfer', 'fs_chunk_size')):
                 if chunk:
                     buffer.extend(chunk)
         finally:
@@ -351,11 +375,12 @@ class ContentMixin(object):
         return buffer
 
     def download_thumbnail(self, node_id: str, file_name: str, max_dim=128):
-        """Download a movie's/picture's thumbnail into a file.
+        """Download a movie's or picture's thumbnail into a file.
         Officially supports the image formats JPEG, BMP, PNG, TIFF, some RAW formats
         and the video formats MP4, QuickTime, AVI, MTS, MPEG, ASF, WMV, FLV, OGG.
         See http://www.amazon.com/gp/help/customer/display.html?nodeId=201634590
         Additionally supports MKV.
+
         :param max_dim: maximum width or height of the resized image/video thumbnail
         """
 

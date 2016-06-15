@@ -11,8 +11,13 @@ from acdcli.cache import db
 
 from .test_helper import gen_file, gen_folder, gen_bunch_of_nodes
 
-path = os.path.join(os.path.dirname(__file__), 'dummy_files')
-acd_cli.CACHE_PATH = path
+cache_path = os.path.join(os.path.dirname(__file__), 'dummy_files')
+os.environ['ACD_CLI_CACHE_PATH'] = cache_path
+
+try:
+    from importlib import reload
+except ImportError:
+    from imp import reload
 
 
 def run_main() -> int:
@@ -22,26 +27,21 @@ def run_main() -> int:
         return e.code
 
 
-def devnull():
-    """Redirect stdout to /dev/null"""
-    sys.stdout = open(os.devnull, 'w')
-
-
 class ActionTestCase(unittest.TestCase):
     stdout = sys.stdout
 
     def setUp(self):
+        reload(acd_cli)
         sys.argv = [acd_cli._app_name, '-nw']
-        self.cache = db.NodeCache(path)
+        self.cache = db.NodeCache(cache_path)
 
     def tearDown(self):
-        sys.stdout = self.stdout
-        db.remove_db_file(path)
+        self.cache.remove_db_file()
 
     # tests
 
-    def testHelp(self):
-        devnull()
+    @patch('sys.stdout.write')
+    def testHelp(self, print_):
         sys.argv.append('-h')
         self.assertEqual(run_main(), 0)
 
@@ -50,9 +50,9 @@ class ActionTestCase(unittest.TestCase):
         self.assertEqual(run_main(), None)
 
     def testClearCacheNonExist(self):
-        db.remove_db_file(path)
+        self.cache.remove_db_file()
         sys.argv.append('cc')
-        self.assertEqual(run_main(), acd_cli.ERROR_RETVAL)
+        self.assertEqual(run_main(), None)
 
     # listing
 
@@ -67,7 +67,7 @@ class ActionTestCase(unittest.TestCase):
 
     @patch('sys.stdout.write')
     def testList(self, print_):
-        db.NodeCache(path)
+        db.NodeCache(cache_path)
         folder = gen_folder([])
         files = [gen_file([folder]) for _ in range(50)]
 
@@ -111,12 +111,7 @@ class ActionTestCase(unittest.TestCase):
 
     def testInit(self):
         sys.argv.append('init')
-        acd_cli.cache.insert_nodes([gen_folder()])
-        self.assertEqual(run_main(), None)
-
-    def testDumpSQL(self):
-        devnull()
-        sys.argv.append('dumpsql')
+        self.cache.insert_nodes([gen_folder()])
         self.assertEqual(run_main(), None)
 
     # misc

@@ -4,22 +4,28 @@ import os
 import json
 import argparse
 import logging
+import logging.handlers
 import signal
-from datetime import datetime, timedelta
 import time
 import re
 import appdirs
-from functools import partial
+
 from collections import namedtuple
+from configparser import ConfigParser
+from functools import partial
+from multiprocessing import Event
 
 from pkgutil import walk_packages
 from pkg_resources import iter_entry_points
 
+import acdcli
 from acdcli.api import client
 from acdcli.api.common import RequestError, is_valid_id
-from acdcli.cache import db, format
+from acdcli.cache import format, db
 from acdcli.utils import hashing, progress
+from acdcli.utils.conf import get_conf
 from acdcli.utils.threading import QueuedLoader
+from acdcli.utils.time import *
 
 # load local plugin modules (default ones, for developers)
 from acdcli import plugins
@@ -33,39 +39,9 @@ for importer, modname, ispkg in walk_packages(path=plugins.__path__, prefix=plug
 for plug_mod in iter_entry_points(group='acdcli.plugins', name=None):
     __import__(plug_mod.module_name)
 
-__version__ = '0.3.0a6'
 _app_name = 'acd_cli'
 
 logger = logging.getLogger(_app_name)
-
-# noinspection PyBroadException
-# monkey patch the user agent
-try:
-    import requests.utils
-
-    if 'old_dau' not in dir(requests.utils):
-        requests.utils.old_dau = requests.utils.default_user_agent
-
-        def new_dau():
-            return _app_name + '/' + __version__ + ' ' + requests.utils.old_dau()
-
-        requests.utils.default_user_agent = new_dau
-except:
-    pass
-
-
-# monkey patch for suppressing overlong http.client's HTTPConnection send debug prints
-def ellipses_print(*args, **kwargs):
-    for a in args:
-        if len(a) > 2000:
-            print('[...]', **kwargs)
-            return
-
-    print(*args, **kwargs)
-
-import http.client as cl
-cl.print = ellipses_print
-
 
 # path settings
 
@@ -75,12 +51,31 @@ sp = os.environ.get('ACD_CLI_SETTINGS_PATH')
 CACHE_PATH = cp if cp else appdirs.user_cache_dir(_app_name)
 SETTINGS_PATH = sp if sp else appdirs.user_config_dir(_app_name)
 
-if not os.path.isdir(CACHE_PATH):
-    try:
-        os.makedirs(CACHE_PATH, mode=0o0700)  # private data
-    except OSError:
-        logger.critical('Error creating cache directory "%s"' % CACHE_PATH)
-        sys.exit(1)
+paths = {CACHE_PATH: True, SETTINGS_PATH: False}  # path:str : critical:bool
+
+for path in paths:
+    if not os.path.isdir(path):
+        try:
+            os.makedirs(path, mode=0o0700)  # private data
+        except OSError:
+            err_msg = 'Error creating directory "%s".'
+            if paths[path]:
+                logger.critical(err_msg % path)
+                sys.exit(1)
+            else:
+                logger.warning(err_msg % path)
+
+def_conf = ConfigParser()
+def_conf['download'] = dict(keep_corrupt=False, keep_incomplete=True)
+conf = get_conf(SETTINGS_PATH, 'acd_cli.ini', def_conf)
+
+# consts
+
+MIN_AUTOSYNC_INTERVAL = 60
+MAX_LOG_SIZE = 10 * 2 ** 20
+MAX_LOG_FILES = 5
+
+TIMESTAMP_FORMAT = "%Y-%m-%d_%H:%M:%S"
 
 # return values
 
@@ -99,6 +94,7 @@ CACHE_ASYNC = 256
 DUPLICATE = 512
 DUPLICATE_DIR = 1024
 NAME_COLLISION = 2048
+ERR_DEL_FILE = 4096
 
 
 def signal_handler(signal_, frame):
@@ -117,6 +113,7 @@ def pprint(d: dict):
 acd_client = None
 cache = None
 
+
 #
 # Glue functions (API, cache)
 #
@@ -128,32 +125,67 @@ class CacheConsts(object):
     MAX_AGE = 30
 
 
-def sync_node_list(full=False):
+def sync_node_list(full=False, to_file=None, from_file=None) -> 'Union[int, None]':
     global cache
-    cp = cache.KeyValueStorage.get(CacheConsts.CHECKPOINT_KEY) if not full else None
+    cp_ = cache.KeyValueStorage.get(CacheConsts.CHECKPOINT_KEY) if not full else None
+
+    print('Getting changes', end='', flush=True)
+
+    if from_file:
+        f = open(from_file, 'rb')
+    else:
+        f = acd_client.get_changes(checkpoint=cp_, include_purged=bool(cp_), silent=False,
+                                   file=to_file if to_file else None)
+
+        if to_file:
+            f.close()
+            return
 
     try:
-        nodes, purged, ncp, full = acd_client.get_changes(checkpoint=cp, include_purged=not not cp)
+        first = True
+
+        for changeset in acd_client._iter_changes_lines(f):
+            if to_file:
+                if first:
+                    out = open(to_file, 'wb')
+                out.write(b'%s\n' % str(changeset))
+                continue
+
+            if changeset.reset or (full and first):
+                cache.drop_all()
+                cache.init()
+                full = True
+            else:
+                cache.remove_purged(changeset.purged_nodes)
+
+            if first:
+                print('Inserting nodes', end='', flush=True)
+
+            if len(changeset.nodes) > 0:
+                cache.insert_nodes(changeset.nodes, partial=not full)
+            cache.KeyValueStorage.update({CacheConsts.LAST_SYNC_KEY: time.time()})
+
+            if len(changeset.nodes) > 0 or len(changeset.purged_nodes) > 0:
+                cache.KeyValueStorage.update({CacheConsts.CHECKPOINT_KEY: changeset.checkpoint})
+
+            print('.', end='', flush=True)
+            first = False
+
     except RequestError as e:
-        logger.critical('Sync failed.')
         print(e)
+        if e.CODE == RequestError.CODE.INCOMPLETE_RESULT:
+            logger.warning('Sync incomplete.')
+        else:
+            logger.critical('Sync failed.')
         return ERROR_RETVAL
-
-    if full:
-        cache.drop_all()
-        cache = db.NodeCache(CACHE_PATH)
-    else:
-        cache.remove_purged(purged)
-
-    if len(nodes) > 0:
-        cache.insert_nodes(nodes, partial=not full)
-    cache.KeyValueStorage.update({CacheConsts.LAST_SYNC_KEY: time.time()})
-
-    if len(nodes) > 0 or len(purged) > 0:
-        cache.KeyValueStorage.update({CacheConsts.CHECKPOINT_KEY: ncp})
+    finally:
+        if not first:
+            print()
+        if to_file:
+            out.close()
 
 
-def old_sync():
+def old_sync() -> 'Union[int, None]':
     global cache
     cache.drop_all()
     cache = db.NodeCache(CACHE_PATH)
@@ -171,25 +203,46 @@ def old_sync():
     cache.KeyValueStorage['sync_date'] = time.time()
 
 
+def autosync(interval: int, stop: Event = None):
+    """Periodically syncs the node cache each *interval* seconds.
+
+    :param stop: Event that may be triggered to end syncing."""
+
+    if not interval:
+        return
+
+    interval = max(MIN_AUTOSYNC_INTERVAL, interval)
+    while True:
+        if stop.is_set():
+            break
+        try:
+            sync_node_list(full=False)
+        except:
+            import traceback
+            logger.error(traceback.format_exc())
+        time.sleep(interval)
+
+
 #
 # File transfer
 #
 
 RetryRetVal = namedtuple('RetryRetVal', ['ret_val', 'retry'])
 STD_RETRY_RETVALS = [UL_DL_FAILED]
+DL_RETRY_RETVALS = [UL_DL_FAILED, HASH_MISMATCH]
 
-
-def retry_on(ret_vals: list):
+def retry_on(ret_vals: 'List[int]'):
     """Retry decorator that sets the wrapped function's progress handler argument according to its
     return value and wraps the return value in RetryRetVal object.
+
     :param ret_vals: list of retry values on which execution should be repeated"""
 
-    def wrap(f):
+    def wrap(f: 'Callable'):
         def wrapped(*args, **kwargs) -> RetryRetVal:
             ret_val = ERROR_RETVAL
             try:
                 ret_val = f(*args, **kwargs)
-            except Exception:
+            except:
                 import traceback
                 logger.error(traceback.format_exc())
             h = kwargs.get('pg_handler')
@@ -203,6 +256,10 @@ def retry_on(ret_vals: list):
 
     return wrap
 
+#
+# things to do on successful transfer
+#
+
 
 def compare_hashes(hash1: str, hash2: str, file_name: str) -> int:
     if hash1 != hash2:
@@ -213,11 +270,104 @@ def compare_hashes(hash1: str, hash2: str, file_name: str) -> int:
     return 0
 
 
+def compare_sizes(size1: int, size2: int, file_name: str) -> int:
+    if size1 != size2:
+        logger.error('Size mismatch between local and remote file for "%s".' % file_name)
+        return SIZE_MISMATCH
+
+    logger.debug('Local and remote sizes match for "%s".' % file_name)
+    return 0
+
+
+def remove_file(path: str) -> int:
+    try:
+        os.remove(path)
+    except OSError:
+        logger.error('Removing file "%s" failed.' % path)
+        return ERR_DEL_FILE
+
+    logger.debug('Deleted "%s".' % path)
+    return 0
+
+
+def upload_complete(node: dict, path: str, hash_: str, size_: int, rsf: bool) -> int:
+    cache.insert_node(node)
+    node = cache.get_node(node['id'])
+
+    match = (compare_hashes(hash_, node.md5, path) |
+             compare_sizes(size_, node.size, path) if size_ is not None else 0)
+    if match != 0:
+        return match
+
+    if rsf:
+        return remove_file(path)
+
+    return 0
+
+
+def upload_timeout(parent_id: str, path: str, hash_: str, size_: int, rsf: bool) -> int:
+    minutes = 10
+    while minutes > 0:
+        time.sleep(60)
+        minutes -= 1
+        l = acd_client.list_children(parent_id)
+        for n in l:
+            if os.path.basename(path) == n['name']:
+                return upload_complete(n, path, hash_, size_, rsf)
+
+    logger.warning('Timeout while uploading "%s".' % path)
+    return UL_TIMEOUT
+
+
+def overwrite_timeout(initial_node: dict, path: str, hash_: str, size_: int, rsf: bool) -> int:
+    minutes = 10
+    while minutes > 0:
+        time.sleep(60)
+        minutes -= 1
+        n = acd_client.get_metadata(initial_node['id'])
+        if n['version'] > initial_node['version']:
+            return upload_complete(n, path, hash_, size_, rsf)
+
+    logger.warning('Timeout while overwriting "%s".' % path)
+    return UL_TIMEOUT
+
+
+def download_complete(node: 'Node', path: str, hash_: str, rsf: bool):
+    md5_match = compare_hashes(node.md5, hash_, node.name)
+    if md5_match != 0:
+        if not conf.getboolean('download', 'keep_corrupt'):
+            return md5_match | remove_file(path)
+        else:
+            os.rename(path, '%s_%s' % (path, datetime.now().strftime(TIMESTAMP_FORMAT)))
+            return md5_match
+
+    size_match = compare_sizes(node.size, os.path.getsize(path), path)
+    if size_match != 0:
+        return size_match
+
+    if rsf:
+        try:
+            r = acd_client.move_to_trash(node.id)
+            cache.insert_node(r)
+        except RequestError as e:
+            print(e)
+            return ERROR_RETVAL
+
+    return 0
+
+#
+# Transfer job creation and actual transfer
+#
+
+
 def create_upload_jobs(dirs: list, path: str, parent_id: str, overwr: bool, force: bool,
-                       dedup: bool, exclude: list, exclude_paths: list, jobs: list) -> int:
+                       dedup: bool, rsf: bool, exclude: list, exclude_paths: list, jobs: list) \
+        -> int:
     """Creates upload job if passed path is a file, delegates directory traversal otherwise.
     Detects soft links that link to an already queued directory.
+
     :param dirs: list of directories' inodes traversed so far
+    :param rsf: remove source files
     :param exclude: list of file exclusion patterns
     :param exclude_paths: list of paths for file or directory exclusion"""
 
@@ -236,7 +386,7 @@ def create_upload_jobs(dirs: list, path: str, parent_id: str, overwr: bool, forc
             return DUPLICATE_DIR
         dirs.append(ino)
         return traverse_ul_dir(dirs, path, parent_id, overwr, force, dedup,
-                               exclude, exclude_paths, jobs)
+                               rsf, exclude, exclude_paths, jobs)
     elif os.path.isfile(path):
         short_nm = os.path.basename(path)
         for reg in exclude:
@@ -245,13 +395,17 @@ def create_upload_jobs(dirs: list, path: str, parent_id: str, overwr: bool, forc
                 return 0
 
         prog = progress.FileProgress(os.path.getsize(path))
-        fo = partial(upload_file, path, parent_id, overwr, force, dedup, pg_handler=prog)
+        fo = partial(upload_file, path, parent_id, overwr, force, dedup, rsf, pg_handler=prog)
         jobs.append(fo)
         return 0
 
+    else:
+        logger.warning('Skipping upload of "%s", possibly because it is a broken symlink.' % path)
+        return INVALID_ARG_RETVAL
+
 
 def traverse_ul_dir(dirs: list, directory: str, parent_id: str, overwr: bool, force: bool,
-                    dedup: bool, exclude: list, exclude_paths: list, jobs: list) -> int:
+                    dedup: bool, rsf: bool, exclude: list, exclude_paths: list, jobs: list) -> int:
     """Duplicates local directory structure."""
 
     if parent_id is None:
@@ -261,11 +415,11 @@ def traverse_ul_dir(dirs: list, directory: str, parent_id: str, overwr: bool, fo
     real_path = os.path.realpath(directory)
     short_nm = os.path.basename(real_path)
 
-    curr_node = parent.get_child(short_nm)
-    if not curr_node or not curr_node.is_available() or not parent.is_available():
+    curr_node = cache.get_child(parent_id, short_nm)
+    if not curr_node or not curr_node.is_available or not parent.is_available:
         try:
             r = acd_client.create_folder(short_nm, parent_id)
-            logger.info('Created folder "%s"' % (parent.full_path() + short_nm))
+            logger.info('Created folder "%s"' % (cache.first_path(parent.id) + short_nm))
             cache.insert_node(r)
             curr_node = cache.get_node(r['id'])
         except RequestError as e:
@@ -274,7 +428,7 @@ def traverse_ul_dir(dirs: list, directory: str, parent_id: str, overwr: bool, fo
             else:
                 logger.error('Error creating remote folder "%s": %s.' % (short_nm, e))
             return ERR_CR_FOLDER
-    elif curr_node.is_file():
+    elif curr_node.is_file:
         logger.error('Cannot create remote folder "%s", '
                      'because a file of the same name already exists.' % short_nm)
         return ERR_CR_FOLDER
@@ -290,31 +444,37 @@ def traverse_ul_dir(dirs: list, directory: str, parent_id: str, overwr: bool, fo
     for entry in entries:
         full_path = os.path.join(real_path, entry)
         ret_val |= create_upload_jobs(dirs, full_path, curr_node.id,
-                                      overwr, force, dedup, exclude, exclude_paths, jobs)
+                                      overwr, force, dedup, rsf, exclude, exclude_paths, jobs)
 
     return ret_val
 
 
 @retry_on(STD_RETRY_RETVALS)
-def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: bool,
-                pg_handler: progress.FileProgress=None) -> RetryRetVal:
+def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: bool, rsf: bool,
+                pg_handler: progress.FileProgress = None) -> RetryRetVal:
     short_nm = os.path.basename(path)
 
     if dedup and cache.file_size_exists(os.path.getsize(path)):
-        nodes = cache.find_md5(hashing.hash_file(path))
-        nodes = [n for n in format.PathFormatter(nodes)]
+        nodes = cache.find_by_md5(hashing.hash_file(path))
+        nodes = [n for n in cache.path_format(nodes)]
         if len(nodes) > 0:
-            # print('Skipping upload of duplicate file "%s".' % short_nm)
-            logger.info('Location of duplicates: %s' % nodes)
+            logger.info('Skipping upload of duplicate file "%s". Location of duplicates: %s' % (short_nm, nodes))
             pg_handler.done()
+            if rsf:
+                return remove_file(path)
             return DUPLICATE
 
-    conflicting_node = cache.conflicting_node(short_nm, parent_id)
+    conflicting_node = cache.get_conflicting_node(short_nm, parent_id)
     file_id = None
     if conflicting_node:
-        if conflicting_node.is_folder():
+        if conflicting_node.name != short_nm:
+            logger.error('File name "%s" collides with remote node "%s".'
+                         % (short_nm, conflicting_node.name))
+            return NAME_COLLISION
+
+        if conflicting_node.is_folder:
             logger.error('Name collision with existing folder '
-                         'in the same location: "%".' % short_nm)
+                         'in the same location: "%s".' % short_nm)
             return NAME_COLLISION
 
         file_id = conflicting_node.id
@@ -322,10 +482,11 @@ def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: boo
     if not file_id:
         logger.info('Uploading %s' % path)
         hasher = hashing.IncrementalHasher()
+        local_size = os.path.getsize(path)
         try:
             r = acd_client.upload_file(path, parent_id,
-                                    read_callbacks=[hasher.update, pg_handler.update],
-                                    deduplication=dedup)
+                                       read_callbacks=[hasher.update, pg_handler.update],
+                                       deduplication=dedup)
         except RequestError as e:
             if e.status_code == 409:  # might happen if cache is outdated
                 if not dedup:
@@ -339,36 +500,40 @@ def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: boo
                 # colliding node ID is returned in error message -> could be used to continue
                 return CACHE_ASYNC
             elif e.status_code == 504 or e.status_code == 408:  # proxy timeout / request timeout
-                logger.warning('Timeout while uploading "%s".' % short_nm)
-                # TODO: wait; request parent folder's children
-                return UL_TIMEOUT
+                return upload_timeout(parent_id, path, hasher.get_result(), local_size, rsf)
             else:
-                logger.error(
-                    'Uploading "%s" failed. Code: %s, msg: %s' % (short_nm, e.status_code, e.msg))
+                logger.error('Uploading "%s" failed. %s.' % (short_nm, str(e)))
                 return UL_DL_FAILED
         else:
-            cache.insert_node(r)
-            file_id = r['id']
-            md5 = cache.get_node(file_id).md5
-            return compare_hashes(hasher.get_result(), md5, short_nm)
+            return upload_complete(r, path, hasher.get_result(), local_size, rsf)
 
     # else: file exists
-    if not overwr and not force:
-        logger.info('Skipping upload of existing file "%s".' % short_nm)
-        pg_handler.done()
-        return 0
 
-    rmod = (conflicting_node.modified - datetime(1970, 1, 1)) / timedelta(seconds=1)
+    rmod = datetime_to_timestamp(conflicting_node.modified)
     rmod = datetime.utcfromtimestamp(rmod)
     lmod = datetime.utcfromtimestamp(os.path.getmtime(path))
     lcre = datetime.utcfromtimestamp(os.path.getctime(path))
 
     logger.debug('Remote mtime: %s, local mtime: %s, local ctime: %s' % (rmod, lmod, lcre))
 
+    if not overwr and not force:
+        logger.info('Skipping upload of existing file "%s".' % short_nm)
+        pg_handler.done()
+        
+        if not rsf:
+            return 0
+
+        if not compare_sizes(os.path.getsize(path), conflicting_node.size, short_nm):
+            return remove_file(path)
+        
+        logger.info('Keeping "%s" because of remote size mismatch.' % path)
+        return 0
+
+
     # ctime is checked because files can be overwritten by files with older mtime
     if rmod < lmod or (rmod < lcre and conflicting_node.size != os.path.getsize(path)) \
             or force:
-        return overwrite(file_id, path, dedup=dedup, pg_handler=pg_handler).ret_val
+        return overwrite(file_id, path, dedup=dedup, rsf=rsf, pg_handler=pg_handler).ret_val
     elif not force:
         logger.info('Skipping upload of "%s" because of mtime or ctime and size.' % short_nm)
         pg_handler.done()
@@ -376,49 +541,74 @@ def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: boo
 
 
 @retry_on(STD_RETRY_RETVALS)
-def overwrite(node_id, local_file, dedup=False,
-              pg_handler: progress.FileProgress=None) -> RetryRetVal:
+def overwrite(node_id: str, local_file: str, dedup=False, rsf=False,
+              pg_handler: progress.FileProgress = None) -> RetryRetVal:
     hasher = hashing.IncrementalHasher()
+    local_size = os.path.getsize(local_file)
+
+    initial_node = acd_client.get_metadata(node_id)
+
+    logger.info('Overwriting "%s" with "%s".' % (node_id, local_file))
+
     try:
         r = acd_client.overwrite_file(node_id, local_file,
-                                   read_callbacks=[hasher.update, pg_handler.update],
-                                   deduplication=dedup)
-        cache.insert_node(r)
-        node = cache.get_node(r['id'])
-        md5 = node.md5
-
-        return compare_hashes(md5, hasher.get_result(), local_file)
+                                      read_callbacks=[hasher.update, pg_handler.update],
+                                      deduplication=dedup)
     except RequestError as e:
-        logger.error('Error overwriting file. Code: %s, msg: %s' % (e.status_code, e.msg))
+        if e.status_code == 504 or e.status_code == 408:  # proxy timeout / request timeout
+            return overwrite_timeout(initial_node, local_file, hasher.get_result(), local_size, rsf)
+
+        logger.error('Error overwriting "%s". %s' % (node_id, str(e)))
         return UL_DL_FAILED
+    else:
+        return upload_complete(r, local_file, hasher.get_result(), local_size, rsf)
 
 
 @retry_on([])
-def upload_stream(stream, file_name, parent_id, dedup=False,
-                  pg_handler: progress.FileProgress=None) -> RetryRetVal:
+def upload_stream(stream, file_name, parent_id, overwr=False, dedup=False,
+                  pg_handler: progress.FileProgress = None) -> RetryRetVal:
     hasher = hashing.IncrementalHasher()
+    child = cache.get_child(parent_id, file_name)
+    log_fname = 'stream/' + file_name
+
+    if child and not overwr:
+        logger.warning('Skipping streamed upload because file "%s" exists.' % file_name)
+        return 0
+
     try:
-        r = acd_client.upload_stream(stream, file_name, parent_id,
-                                  read_callbacks=[hasher.update, pg_handler.update],
-                                  deduplication=dedup)
-        cache.insert_node(r)
-        node = cache.get_node(r['id'])
-        return compare_hashes(node.md5, hasher.get_result(), 'stream')
+        if child:
+            initial_node = acd_client.get_metadata(child.id)
+            r = acd_client.overwrite_stream(stream, child.id,
+                                            read_callbacks=[hasher.update, pg_handler.update])
+        else:
+            r = acd_client.upload_stream(stream, file_name, parent_id,
+                                         read_callbacks=[hasher.update, pg_handler.update],
+                                         deduplication=dedup)
     except RequestError as e:
-        logger.error('Error uploading stream. Code: %s, msg: %s' % (e.status_code, e.msg))
+        if e.status_code == 504 or e.status_code == 408:  # proxy timeout / request timeout
+            if child:
+                return overwrite_timeout(initial_node, log_fname, hasher.get_result(), None, False)
+            else:
+                return upload_timeout(parent_id, log_fname, hasher.get_result(), None, False)
+        logger.error('Error uploading stream. %s' % str(e))
         return UL_DL_FAILED
+    else:
+        return upload_complete(r, log_fname, hasher.get_result(), None, False)
 
 
-def create_dl_jobs(node_id: str, local_path: str, exclude: list, jobs: list) -> int:
-    """Populates passed jobs list with download partials."""
+def create_dl_jobs(node_id: str, local_path: str, preserve_mtime: bool, rsf: bool,
+                   exclude: 'List[re._pattern_type]', jobs: list) -> int:
+    """Appends download partials for folder/file node pointed to by *node_id*
+    to the **jobs** list."""
+
     local_path = local_path if local_path else ''
 
     node = cache.get_node(node_id)
-    if not node.is_available():
+    if not node.is_available:
         return 0
 
-    if node.is_folder():
-        return traverse_dl_folder(node_id, local_path, exclude, jobs)
+    if node.is_folder:
+        return traverse_dl_folder(node, local_path, preserve_mtime, rsf, exclude, jobs)
 
     loc_name = node.name
 
@@ -436,19 +626,18 @@ def create_dl_jobs(node_id: str, local_path: str, exclude: list, jobs: list) -> 
         return 0
 
     prog = progress.FileProgress(node.size)
-    fo = partial(download_file, node_id, local_path, pg_handler=prog)
+    fo = partial(download_file, node_id, local_path, preserve_mtime, rsf, pg_handler=prog)
     jobs.append(fo)
 
     return 0
 
 
-def traverse_dl_folder(node_id: str, local_path: str, exclude: list, jobs: list) -> int:
+def traverse_dl_folder(node: 'Node', local_path: str, preserve_mtime: bool, rsf: bool,
+                       exclude: 'List[re._pattern_type', jobs: list) -> int:
     """Duplicates remote folder structure."""
 
     if not local_path:
         local_path = os.getcwd()
-
-    node = cache.get_node(node_id)
 
     if node.name is None:
         curr_path = os.path.join(local_path, 'acd')
@@ -462,34 +651,41 @@ def traverse_dl_folder(node_id: str, local_path: str, exclude: list, jobs: list)
         return ERR_CR_FOLDER
 
     ret_val = 0
-    children = sorted(node.children)
-    for child in children:
-        ret_val |= create_dl_jobs(child.id, curr_path, exclude, jobs)
+    folders, files = cache.list_children(node.id)
+    folders, files = sorted(folders), sorted(files)
+
+    for file in files:
+        ret_val |= create_dl_jobs(file.id, curr_path, preserve_mtime, rsf, exclude, jobs)
+    for folder in folders:
+        ret_val |= traverse_dl_folder(folder, curr_path, preserve_mtime, rsf, exclude, jobs)
     return ret_val
 
 
-@retry_on(STD_RETRY_RETVALS)
-def download_file(node_id: str, local_path: str,
-                  pg_handler: progress.FileProgress=None) -> RetryRetVal:
+@retry_on(DL_RETRY_RETVALS)
+def download_file(node_id: str, local_path: str, preserve_mtime: bool, rsf: bool,
+                  pg_handler: progress.FileProgress = None) -> RetryRetVal:
     node = cache.get_node(node_id)
     name, md5, size = node.name, node.md5, node.size
-    # db.Session.remove()  # otherwise, sqlalchemy will complain if thread crashes
 
-    logger.info('Downloading "%s"' % name)
+    logger.info('Downloading "%s".' % name)
 
     hasher = hashing.IncrementalHasher()
     try:
         acd_client.download_file(node_id, name, local_path, length=size,
-                              write_callbacks=[hasher.update, pg_handler.update])
+                                 write_callbacks=[hasher.update, pg_handler.update])
     except RequestError as e:
-        logger.error('Downloading "%s" failed. Code: %s, msg: %s' % (name, e.status_code, e.msg))
+        logger.error('Downloading "%s" failed. %s' % (name, str(e)))
         return UL_DL_FAILED
     else:
-        return compare_hashes(hasher.get_result(), md5, name)
+        if preserve_mtime:
+            mtime = datetime_to_timestamp(node.modified)
+            os.utime(os.path.join(local_path, name), (mtime, mtime))
+
+        return download_complete(node, os.path.join(local_path, name), hasher.get_result(), rsf)
 
 
 #
-# Subparser actions. Return value [typeof(None), int] will be used as sys exit status.
+# Subparser actions. Return value Union[None, int] will be used as sys exit status.
 #
 
 # decorators
@@ -520,16 +716,14 @@ def no_autores_trash_action(func):
 # actual actions
 
 def sync_action(args: argparse.Namespace):
-    print('Syncing...')
-    r = sync_node_list(full=args.full)
-    print('Done.')
-    return r
+    return sync_node_list(args.full, args.to_file, args.from_file)
 
 
 def old_sync_action(args: argparse.Namespace):
     print('Syncing...')
     r = old_sync()
-    print('Done.')
+    if not r:
+        print('Done.')
     return r
 
 
@@ -550,29 +744,28 @@ def delete_everything_action(args: argparse.Namespace):
         print('Deleting directory failed.')
 
 
-@nocache_action
 @offline_action
 def clear_action(args: argparse.Namespace):
-    if not db.remove_db_file(CACHE_PATH):
+    if not cache.drop_all():
         return ERROR_RETVAL
 
 
 @nocache_action
 @offline_action
 def print_version_action(args: argparse.Namespace):
-    print(' '.join([_app_name, __version__]))
+    print('%s %s, api %s ' % (_app_name, acdcli.__version__, acdcli.api.__version__))
 
 
 @offline_action
 def tree_action(args: argparse.Namespace):
-    tree = cache.tree(args.node, args.include_trash)
-    if tree is None:
+    node = cache.get_node(args.node)
+    if not node or not node.is_folder:
         logger.critical('Invalid folder.')
         return INVALID_ARG_RETVAL
 
-    tree = format.TreeFormatter(tree)
-    for node in tree:
-        print(node)
+    for line in cache.tree_format(node, args.node_path, trash=args.include_trash,
+                                  dir_only=args.dir_only, max_depth=args.max_depth):
+        print(line)
 
 
 @nocache_action
@@ -587,7 +780,7 @@ def quota_action(args: argparse.Namespace):
     pprint(r)
 
 
-def regex_helper(args: argparse.Namespace) -> list:
+def regex_helper(args: argparse.Namespace) -> 'List[re._pattern_type]':
     """Pre-compiles regexes from strings in args namespace."""
     excl_re = []
     for re_ in args.exclude_re:
@@ -620,9 +813,10 @@ def upload_action(args: argparse.Namespace) -> int:
             continue
 
         ret_val |= create_upload_jobs([], path, args.parent, args.overwrite, args.force,
-                                      args.deduplicate, excl_re, args.exclude_path, jobs)
+                                      args.deduplicate, args.remove_source_files,
+                                      excl_re, args.exclude_path, jobs)
 
-    ql = QueuedLoader(args.max_connections, max_retries=args.max_retries)
+    ql = QueuedLoader(args.max_connections, args.print_progress, max_retries=args.max_retries)
     ql.add_jobs(jobs)
 
     return ret_val | ql.start()
@@ -630,14 +824,15 @@ def upload_action(args: argparse.Namespace) -> int:
 
 @no_autores_trash_action
 def upload_stream_action(args: argparse.Namespace) -> int:
-    if not cache. get_node(args.parent):
+    if not cache.get_node(args.parent):
         logger.critical('Invalid upload folder')
         return INVALID_ARG_RETVAL
 
     prog = progress.FileProgress(0)
-    ql = QueuedLoader(max_retries=0)
+    ql = QueuedLoader(print_progress=args.print_progress, max_retries=0)
     job = partial(upload_stream,
-                  sys.stdin.buffer, args.name, args.parent, args.deduplicate, pg_handler=prog)
+                  sys.stdin.buffer, args.name, args.parent, args.overwrite, args.deduplicate,
+                  pg_handler=prog)
     ql.add_jobs([job])
 
     return ql.start()
@@ -649,7 +844,7 @@ def overwrite_action(args: argparse.Namespace) -> int:
         return INVALID_ARG_RETVAL
 
     prog = progress.FileProgress(os.path.getsize(args.file))
-    ql = QueuedLoader(max_retries=args.max_retries)
+    ql = QueuedLoader(print_progress=args.print_progress, max_retries=args.max_retries)
     job = partial(overwrite, args.node, args.file, pg_handler=prog)
     ql.add_jobs([job])
 
@@ -661,9 +856,10 @@ def download_action(args: argparse.Namespace) -> int:
 
     jobs = []
     ret_val = 0
-    ret_val |= create_dl_jobs(args.node, args.path, excl_re, jobs)
+    ret_val |= create_dl_jobs(args.node, args.path, args.times, args.remove_source_files,
+                              excl_re, jobs)
 
-    ql = QueuedLoader(args.max_connections, max_retries=args.max_retries)
+    ql = QueuedLoader(args.max_connections, args.print_progress, args.max_retries)
     ql.add_jobs(jobs)
 
     return ret_val | ql.start()
@@ -671,53 +867,88 @@ def download_action(args: argparse.Namespace) -> int:
 
 def cat_action(args: argparse.Namespace) -> int:
     n = cache.get_node(args.node)
-    if not n or not n.is_file():
+    if not n or not n.is_file:
         return INVALID_ARG_RETVAL
 
     try:
         acd_client.chunked_download(args.node, sys.stdout.buffer)
     except RequestError as e:
-        logger.error('Downloading failed. Code: %s, msg: %s' % (e.status_code, e.msg))
+        logger.error('Downloading failed. %s' % str(e))
         return UL_DL_FAILED
 
     return 0
 
 
-def create_action(args: argparse.Namespace) -> int:
-    parent, folder = os.path.split(args.new_folder)
-    # no trailing slash
-    if not folder:
-        parent, folder = os.path.split(parent)
+def mkdir(parent, name: str) -> bool:
+    """Creates a folder and inserts it into cache upon success."""
+    if parent.is_file:
+        logger.error('Cannot create directory "%s". Parent is not a folder.' % name)
+        return False
 
-    if not folder:
-        logger.error('Cannot create folder with empty name.')
-        return INVALID_ARG_RETVAL
+    parent_id = parent.id
+    cn = cache.get_conflicting_node(name, parent_id)
 
-    if parent[-1:] == '' or parent[0] != '/':
-        parent = '/' + parent
-    p_id = cache.resolve_path(parent)
-    if not p_id:
-        logger.error('Invalid parent path "%s".' % parent)
-        return INVALID_ARG_RETVAL
+    if cn:
+        if cn.is_file:
+            logger.error('Cannot create directory "%s". A file of that name already exists.' % name)
+            return False
+
+        if cn.name != name:
+            logger.error('Folder name "%s" collides with remote folder "%s".' % (name, cn.name))
+            return False
+
+        logger.warning('Folder "%s" already exists.' % name)
+        return True
 
     try:
-        r = acd_client.create_folder(folder, p_id)
+        r = acd_client.create_folder(name, parent_id)
     except RequestError as e:
-        logger.debug(str(e.status_code) + e.msg)
         if e.status_code == 409:
-            logger.warning('Folder "%s" already exists.' % folder)
+            logger.warning('Node "%s" already exists. %s' % (name, str(e)))
+            return False
         else:
-            logger.error('Error creating folder "%s".' % folder)
-            return ERR_CR_FOLDER
+            logger.error('Error creating folder "%s". %s' % (name, str(e)))
+            return False
     else:
         cache.insert_node(r)
+        return True
+
+
+def create_action(args: argparse.Namespace) -> int:
+    segments = [seg for seg in args.new_folder.split('/') if seg]  # non-empty path segments
+
+    if not segments:
+        return
+
+    cur_path = '/'
+    parent = cache.get_root_node()
+
+    for s in segments[:-1]:
+        cur_path += s + '/'
+        child = cache.get_child(parent.id, s)
+
+        if child:
+            parent = child
+            continue
+
+        if not args.parents:
+            logger.error('Path "%s" does not exist.' % cur_path)
+            return ERR_CR_FOLDER
+
+        if not mkdir(parent, s):
+            return ERR_CR_FOLDER
+
+        parent = cache.get_child(parent.id, s)
+
+    if not mkdir(parent, segments[-1]):
+        return ERR_CR_FOLDER
 
 
 @no_autores_trash_action
 @offline_action
 def list_trash_action(args: argparse.Namespace):
-    t_list = cache.list_trash(args.recursive)
-    for node in format.ListFormatter(t_list, recursive=args.recursive):
+    for node in cache.ls_format(cache.get_root_node().id, [], recursive=args.recursive,
+                                trash_only=True, trashed_children=True):
         print(node)
 
 
@@ -741,7 +972,7 @@ def restore_action(args: argparse.Namespace) -> int:
 
 @offline_action
 def resolve_action(args: argparse.Namespace) -> int:
-    node = cache.resolve_path(args.path)
+    node = cache.resolve(args.path)
     if node:
         print(node)
     else:
@@ -750,12 +981,13 @@ def resolve_action(args: argparse.Namespace) -> int:
 
 @offline_action
 def find_action(args: argparse.Namespace):
-    r = cache.find(args.name)
-    r = format.LongIDFormatter(r)
-    for node in r:
-        print(node)
-    if not r:
+    nodes = cache.find_by_name(args.name)
+
+    if not nodes:
         return INVALID_ARG_RETVAL
+
+    for line in cache.long_id_format(nodes):
+        print(line)
 
 
 @offline_action
@@ -763,9 +995,9 @@ def find_md5_action(args: argparse.Namespace) -> int:
     if len(args.md5) != 32:
         logger.critical('Invalid MD5 specified')
         return INVALID_ARG_RETVAL
-    nodes = cache.find_md5(args.md5)
-    for node in format.LongIDFormatter(nodes):
-        print(node)
+    nodes = cache.find_by_md5(args.md5.lower())
+    for line in cache.long_id_format(nodes):
+        print(line)
 
 
 @offline_action
@@ -773,19 +1005,18 @@ def find_regex_action(args: argparse.Namespace) -> int:
     try:
         re.compile(args.regex)
     except re.error as e:
-        logger.critical('Invalid regular expression specified')
+        logger.critical('Invalid regular expression specified.')
         return INVALID_ARG_RETVAL
-    r = cache.find_regex(args.regex)
-    r = format.LongIDFormatter(r)
-    for node in r:
+    nodes = cache.find_by_regex(args.regex)
+    for node in cache.long_id_format(nodes):
         print(node)
     return 0
 
 
 @offline_action
 def children_action(args: argparse.Namespace) -> int:
-    nodes = cache.list_children(args.node, args.recursive, args.include_trash)
-    for entry in format.ListFormatter(nodes, recursive=args.recursive, long=args.long):
+    for entry in cache.ls_format(args.node, [], args.recursive,
+                                 False, args.include_trash, args.long, args.size_bytes):
         print(entry)
 
 
@@ -793,7 +1024,7 @@ def move_action(args: argparse.Namespace) -> int:
     node = cache.get_node(args.child)
     if not node:
         return INVALID_ARG_RETVAL
-    if len(node.parents) > 1:
+    if cache.num_parents(node.id) > 1:
         logger.error('Cannot move node with multiple parents.')
         return ERROR_RETVAL
 
@@ -841,19 +1072,18 @@ def metadata_action(args: argparse.Namespace) -> int:
         return INVALID_ARG_RETVAL
 
 
-@offline_action
-@nocache_action
-def dump_sql_action(args: argparse.Namespace):
-    cache.dump_table_sql()
-
-
 def mount_action(args: argparse.Namespace):
+    asp = partial(autosync, args.interval, stop=Event())
+
     import acdcli.acd_fuse
     acdcli.acd_fuse.mount(args.path, dict(acd_client=acd_client, cache=cache,
-                                      nlinks=args.nlinks, interval=args.interval),
-                      ro=args.ro, foreground=args.foreground, nothreads=args.single_threaded,
-                      nonempty=args.nonempty,
-                      allow_root=args.allow_root, allow_other=args.allow_other)
+                                          nlinks=args.nlinks, autosync=asp,
+                                          settings_path=SETTINGS_PATH),
+                          ro=args.read_only, foreground=args.foreground,
+                          nothreads=args.single_threaded,
+                          nonempty=args.nonempty, modules=args.modules,
+                          umask=args.umask,gid=args.gid,uid=args.uid,
+                          allow_root=args.allow_root, allow_other=args.allow_other)
 
 
 @offline_action
@@ -868,58 +1098,98 @@ def unmount_action(args: argparse.Namespace):
 #
 
 
-def resolve_remote_path_args(args: argparse.Namespace, attrs: list, incl_trash: bool=True):
+def resolve_remote_path_args(args: argparse.Namespace, attrs: list, incl_trash: bool = True):
     """In-place replaces certain attributes in Namespace by resolved node ID.
     :param attrs: list of attributes that may be given in absolute path form
-    :param incl_trash: whether to resolve trashed files
-    """
+    :param incl_trash: whether to resolve trashed files"""
+
     for id_attr in attrs:
         if hasattr(args, id_attr):
             val = getattr(args, id_attr)
             if not val:
                 continue
             if '/' in val:
-                v = cache.resolve_path(val, trash=incl_trash)
+                val = '/' + '/'.join(list(filter(bool, val.split('/'))))
+                v = cache.resolve(val, trash=incl_trash)
                 if not v:
                     logger.critical('Could not resolve path "%s".' % val)
                     sys.exit(INVALID_ARG_RETVAL)
                 logger.info('Resolved "%s" to "%s"' % (val, v))
-                setattr(args, id_attr, v)
+                setattr(args, id_attr, v.id)
                 setattr(args, id_attr + '_path', val)
-            elif not is_valid_id(val):
+            elif is_valid_id(val):
+                setattr(args, id_attr + '_path', cache.first_path(val))
+            else:
                 logger.critical('Invalid ID format: "%s".' % val)
                 sys.exit(INVALID_ARG_RETVAL)
 
 
 def set_log_level(args: argparse.Namespace):
-    format_ = '%(asctime)s.%(msecs).03d [%(levelname)s] [%(name)s] - %(message)s\x1b[K'
+    fmt = '%(asctime)s.%(msecs).03d [%(levelname)s] [%(name)s] - %(message)s'
+    ansi_fmt = fmt + '\x1b[K'  # clear right
     time_fmt = '%y-%m-%d %H:%M:%S'
 
-    if not args.verbose and not args.debug:
-        logging.basicConfig(level=logging.WARNING, format=format_, datefmt=time_fmt)
+    dumbfmtter = logging.Formatter(fmt=fmt, datefmt=time_fmt)
+    ansifmtter = logging.Formatter(fmt=ansi_fmt, datefmt=time_fmt)
+
+    # stderr handler
+    sh = logging.StreamHandler()
+    tty = hasattr(sys.__stderr__, 'isatty') and sys.__stderr__.isatty()
+    sh.setFormatter(ansifmtter if tty else dumbfmtter)
+
+    # debug log files in cache path
+    rfh = logging.handlers.RotatingFileHandler(os.path.join(CACHE_PATH, _app_name + '.log'),
+                                               maxBytes=MAX_LOG_SIZE, backupCount=MAX_LOG_FILES)
+    rfh.setFormatter(dumbfmtter)
+    rfh.setLevel(logging.DEBUG)
+
+    verbose = False
+    lvl = logging.WARNING
 
     if args.verbose:
-        logging.basicConfig(level=logging.INFO, format=format_, datefmt=time_fmt)
+        lvl = logging.INFO
         if args.verbose > 1:
-            logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
-            logging.getLogger('sqlalchemy.orm').setLevel(logging.INFO)
+            verbose = True
     elif args.debug:
-        logging.basicConfig(level=logging.DEBUG, format=format_, datefmt=time_fmt)
+        lvl = logging.DEBUG
+        if args.debug > 1:
+            verbose = True
 
-        # these debug messages (prints) will not show up in log file
+    sh.setLevel(lvl)
+
+    if verbose:
+        logging.getLogger('sqlalchemy.engine').setLevel(lvl)
+        logging.getLogger('sqlalchemy.orm').setLevel(lvl)
+    if args.debug:
         import http.client
-
         http.client.HTTPConnection.debuglevel = 1
 
-        if args.debug > 1:
-            logging.getLogger('sqlalchemy.engine').setLevel(logging.DEBUG)
-            logging.getLogger('sqlalchemy.orm').setLevel(logging.DEBUG)
+        # monkey patch for suppressing overlong http.client's HTTPConnection send debug prints
+        # TODO: use logger instead of print
+        def ellipses_print(*args, **kwargs):
+            for a in args:
+                if len(a) > 2000:
+                    print('[...]', file=sys.stderr, **kwargs)
+                    return
+
+            print(*args, file=sys.stderr, **kwargs)
+
+        http.client.print = ellipses_print
+
+    root_logger = logging.getLogger()
+    root_logger.addHandler(sh)
+    if args.log:
+        root_logger.addHandler(rfh)
+        root_logger.setLevel(logging.DEBUG)
+    else:
+        root_logger.setLevel(lvl)
 
 
-def set_encoding(force_utf: bool=False):
+def set_encoding(force_utf: bool = False):
     """Sets the default encoding to UTF-8 if none is set.
-    :param force_utf: force UTF-8 output
-    """
+
+    :param force_utf: force UTF-8 output"""
+
     enc = str.lower(sys.stdout.encoding)
     utf_flag = False
 
@@ -929,16 +1199,23 @@ def set_encoding(force_utf: bool=False):
         sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding='utf-8')
         sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding='utf-8')
         utf_flag = True
+    else:
+        def unicode_hook(type_, value, traceback):
+            sys.__excepthook__(type_, value, traceback)
+            if type_ == UnicodeEncodeError:
+                logger.error('Please set your locale or use the "--utf" flag.')
 
-        logger.info('Stdout/stderr encoding changed to UTF-8.')
+        sys.excepthook = unicode_hook
 
     return utf_flag
 
 
-def check_cache():
-    """Checks for existence of root node and cache age."""
+def check_cache() -> bool:
+    """Checks for existence of root node and logs cache age.
 
-    if not cache.get_root_node():
+    :returns: whether a root node was found"""
+
+    if not cache.resolve('/'):
         logger.critical('Root node not found. Please sync.')
         return False
 
@@ -973,7 +1250,11 @@ class Argument(object):
 
 def get_parser() -> tuple:
     max_ret = Argument('--max-retries', '-r', action='store', type=int, default=0,
-                       help='set the maximum number of retries [default: 0]')
+                       help='set the maximum number of retries '
+                            '[default: 0, maximum: %i]' % QueuedLoader.MAX_RETRIES)
+
+    quiet = Argument('--quiet', '-q', action='store_false', dest='print_progress',
+                     help='do not display the progress indicator')
 
     opt_parser = argparse.ArgumentParser(
         prog=_app_name, formatter_class=argparse.RawTextHelpFormatter,
@@ -982,15 +1263,16 @@ def get_parser() -> tuple:
                'e.g. "/folder/file", or via ID \n'
                '  * If you need to enter a node ID that contains a leading dash (minus) sign, '
                'precede it by two dashes and a space, e.g. \'-- -xfH...\'\n'
-               '  * actions marked with [+] have optional arguments'
-               '')
+               '  * actions marked with [+] have optional arguments')
     log_group = opt_parser.add_mutually_exclusive_group()
     log_group.add_argument('-v', '--verbose', action='count',
                            help='prints some info messages to stderr; '
-                                 'use "-vv" to also get sqlalchemy info')
+                                'use "-vv" to also get sqlalchemy info')
     log_group.add_argument('-d', '--debug', action='count',
                            help='prints info and debug to stderr; '
-                                 'use "-dd" to also get sqlalchemy debug messages')
+                                'use "-dd" to also get sqlalchemy debug messages')
+    opt_parser.add_argument('-nl', '--no-log', action='store_false', dest='log',
+                            help='do not save a log of debug messages')
     opt_parser.add_argument('-c', '--color', default=format.ColorMode['never'],
                             choices=format.ColorMode.keys(),
                             help='"never" [default] turns coloring off, '
@@ -1011,26 +1293,36 @@ def get_parser() -> tuple:
     vers_sp.set_defaults(func=print_version_action)
 
     sync_sp = subparsers.add_parser('sync', aliases=['s'],
-                                    help='[+] refresh node list cache; necessary for many actions')
-    sync_sp.add_argument('--full', '-f', action='store_true', help='force a full sync')
+                                    help='[+] refresh node list cache; fetches complete node list '
+                                         'if the cache is empty or incremental changes '
+                                         'if the cache is non-empty')
+    sync_sp.add_argument('--full', '-f', action='store_true',
+                         help='perform a full sync even if the node list is not empty')
+    sync_sp.add_argument('--to-file', help='do not update the cache, but instead write the changes'
+                                           ' into the file specified')
+    sync_sp.add_argument('--from-file', help='update the cache using the contents '
+                                             'of the file specified')
     sync_sp.set_defaults(func=sync_action)
 
     old_sync_sp = subparsers.add_parser('old-sync', add_help=False)
     old_sync_sp.set_defaults(func=old_sync_action)
 
     clear_sp = subparsers.add_parser('clear-cache', aliases=['cc'],
-                                     help='clear node cache [offline operation]\n\n')
+                                     help='delete node cache file [offline operation]\n\n')
     clear_sp.set_defaults(func=clear_action)
 
     tree_sp = subparsers.add_parser('tree', aliases=['t'],
                                     help='[+] print directory tree [offline operation]')
     tree_sp.add_argument('--include-trash', '-t', action='store_true')
-    tree_sp.add_argument('node', nargs='?', default=None, help='root folder for the tree')
+    tree_sp.add_argument('--dir-only', '-d', action='store_true')
+    tree_sp.add_argument('--max-depth', '-L', type=int)
+    tree_sp.add_argument('node', nargs='?', default='/', help='root folder for the tree')
     tree_sp.set_defaults(func=tree_action)
 
     list_c_sp = subparsers.add_parser('children', aliases=['ls', 'dir'],
                                       help='[+] list folder\'s children [offline operation]\n\n')
     list_c_sp.add_argument('--long', '-l', action='store_true', help='long listing format')
+    list_c_sp.add_argument('--size-bytes', '-b', action='store_true', help='file sizes in bytes')
     list_c_sp.add_argument('--include-trash', '-t', action='store_true')
     list_c_sp.add_argument('--recursive', '-r', action='store_true')
     list_c_sp.add_argument('node', nargs='?', default='/',
@@ -1079,21 +1371,29 @@ def get_parser() -> tuple:
     upload_sp.add_argument('--force', '-f', action='store_true', help='force overwrite')
     upload_sp.add_argument('--deduplicate', '-d', action='store_true',
                            help='exclude duplicate files from upload')
+    upload_sp.add_argument('--remove-source-files', '-rsf', action='store_true',
+                           help='remove local files on successful upload or if a remote file'
+                                ' of the same size exists in the upload path or'
+                                ' -d is used and a duplicate exists')
+    quiet.attach(upload_sp)
     upload_sp.add_argument('path', nargs='+', help='a path to a local file or directory')
-    upload_sp.add_argument('parent', help='remote parent folder')
+    upload_sp.add_argument('parent', default='/', help='remote parent folder')
     upload_sp.set_defaults(func=upload_action)
 
     overwrite_sp = subparsers.add_parser('overwrite', aliases=['ov'], help=
-    'overwrite file A [remote] with content of file B [local]')
+                                         'overwrite file A [remote] with content of file B [local]')
     max_ret.attach(overwrite_sp)
+    quiet.attach(overwrite_sp)
     overwrite_sp.add_argument('node')
     overwrite_sp.add_argument('file')
     overwrite_sp.set_defaults(func=overwrite_action)
 
     stream_sp = subparsers.add_parser('stream', aliases=['st'],
                                       help='[+] upload the standard input stream to a file')
+    stream_sp.add_argument('--overwrite', '-o', action='store_true')
     stream_sp.add_argument('--deduplicate', '-d', action='store_true',
                            help='prevent duplicates from getting stored after upload')
+    quiet.attach(stream_sp)
     stream_sp.add_argument('name', help='the remote file name')
     stream_sp.add_argument('parent', help='remote parent folder')
     stream_sp.set_defaults(func=upload_stream_action)
@@ -1101,8 +1401,14 @@ def get_parser() -> tuple:
     download_sp = subparsers.add_parser('download', aliases=['dl'], parents=[re_dummy_sp],
                                         help='download a remote folder or file; '
                                              'will skip existing local files')
+    download_sp.add_argument('--times', '-t', action='store_true',
+                             help='preserve modification times')
+    download_sp.add_argument('--remove-source-files', '-rsf', action='store_true',
+                             help='remove remote files on successful download')
+    quiet.attach(download_sp)
     download_sp.add_argument('node')
-    download_sp.add_argument('path', nargs='?', default=None, help='local download path [optional]')
+    download_sp.add_argument('path', nargs='?', default=None,
+                             help='local download directory [optional]')
     download_sp.set_defaults(func=download_action)
 
     cat_sp = subparsers.add_parser('cat', help='output a file to the standard output stream\n\n')
@@ -1111,6 +1417,8 @@ def get_parser() -> tuple:
 
     cr_fo_sp = subparsers.add_parser('create', aliases=['c', 'mkdir'],
                                      help='create folder using an absolute path\n\n')
+    cr_fo_sp.add_argument('--parents', '-p', action='store_true',
+                          help='create parent folders as needed')
     cr_fo_sp.add_argument('new_folder', help='an absolute folder path, '
                                              'e.g. "/my/dir/"; trailing slash is optional')
     cr_fo_sp.set_defaults(func=create_action)
@@ -1169,20 +1477,34 @@ def get_parser() -> tuple:
     meta_sp.add_argument('node')
     meta_sp.set_defaults(func=metadata_action)
 
+    def_umask = os.umask(0)
+    os.umask(def_umask)
+
     fuse_sp = subparsers.add_parser('mount', help='[+] mount the cloud drive at a local directory')
-    fuse_sp.add_argument('--ro', '-ro', action='store_true', help='mount read-only')
+    fuse_sp.add_argument('--read-only', '-ro', action='store_true', help='mount read-only')
     fuse_sp.add_argument('--foreground', '-fg', action='store_true', help='do not detach')
-    # fuse_sp.add_argument('--single-threaded', '-st', action='store_true')
-    fuse_sp.add_argument('--multi-threaded', '-mt', action='store_false', dest='single_threaded')
+    fuse_sp.add_argument('--single-threaded', '-st', action='store_true')
+    # fuse_sp.add_argument('--multi-threaded', '-mt', action='store_false', dest='single_threaded')
     fuse_sp.add_argument('--nonempty', '-ne', action='store_true',
                          help='allow mounting over a non-empty directory')
     fuse_sp.add_argument('--allow-root', '-ar', action='store_true',
                          help='allow access to root user')
     fuse_sp.add_argument('--allow-other', '-ao', action='store_true',
                          help='allow access to other users')
+    fuse_sp.add_argument('--umask', action='store', default=def_umask,
+                         help='override the permission bits (umask) set by the filesystem (octet)')
+    if os.name == 'nt':
+        pass
+    else:
+        fuse_sp.add_argument('--uid', action='store', default=os.getuid(),
+                             help='override the uid field set by the filesystem (numeric)')
+        fuse_sp.add_argument('--gid', action='store', default=os.getgid(),
+                             help='override the gid field set by the filesystem (numeric)')
+    fuse_sp.add_argument('--modules', action='store', default='',
+                         help='add iconv or subdir modules')
     fuse_sp.add_argument('--nlinks', '-n', action='store_true', help='calculate nlinks')
-    fuse_sp.add_argument('--interval', '-i', type=int, default=60,
-                         help='sync every x seconds [default: 60, off: 0]')
+    fuse_sp.add_argument('--interval', '-i', type=int, default=0,
+                         help='sync every x seconds [turned off by default]')
     fuse_sp.add_argument('path')
     fuse_sp.set_defaults(func=mount_action)
 
@@ -1200,22 +1522,17 @@ def get_parser() -> tuple:
     dn_sp = subparsers.add_parser('init', aliases=['i'], add_help=False)
     dn_sp.set_defaults(func=None)
 
-    # dump sql database creation sequence to stdout
-    dmp_sp = subparsers.add_parser('dumpsql', add_help=False)
-    dmp_sp.set_defaults(func=dump_sql_action)
-
     return opt_parser, subparsers
 
 
 def main():
     opt_parser, subparsers = get_parser()
-    opt_parser.set_defaults(acd_client=lambda: acd_client, cache=lambda: cache)
 
     # plugins
 
     plugin_log = [str(plugins.Plugin)]
     for plugin in plugins.Plugin:
-        if plugin.check_version(__version__):
+        if plugin.check_version(acdcli.__version__):
             log = []
             plugin.attach(subparsers, log)
             plugin_log.extend(log)
@@ -1225,31 +1542,43 @@ def main():
     args = opt_parser.parse_args()
 
     set_log_level(args)
+    if set_encoding(force_utf=args.utf):
+        logger.info('Stdout/stderr encoding changed to UTF-8. ANSI escape codes may not work.')
+    else:
+        import colorama
+        colorama.init()
+
+    check_py_version()
+
     for msg in plugin_log:
         logger.info(msg)
 
-    set_encoding(force_utf=args.utf)
-    check_py_version()
+    logger.info('Settings path is "%s".' % SETTINGS_PATH)
 
     global acd_client
     global cache
 
     if args.func not in offline_actions:
         try:
-            acd_client = client.ACDClient(CACHE_PATH)
+            acd_client = client.ACDClient(CACHE_PATH, SETTINGS_PATH)
         except:
             raise
             sys.exit(INIT_FAILED_RETVAL)
 
     if args.func not in nocache_actions:
         try:
-            cache = db.NodeCache(CACHE_PATH, args.check)
+            cache = db.NodeCache(CACHE_PATH, SETTINGS_PATH, args.check)
         except:
             raise
             sys.exit(INIT_FAILED_RETVAL)
-        if args.func != sync_action:
+
+        if args.func not in [sync_action, old_sync_action, clear_action]:
             if not check_cache():
-                sys.exit(INIT_FAILED_RETVAL)
+                 sys.exit(INIT_FAILED_RETVAL)
+            pass
+
+    args.__setattr__('acd_client', acd_client)
+    args.__setattr__('cache', cache)
 
     format.init(args.color)
 
@@ -1263,11 +1592,20 @@ def main():
 
     # call appropriate sub-parser action
     if args.func:
-        sys.exit(args.func(args))
+        logger.debug(args)
+
+        ret = args.func(args)
+        if not ret:
+            sys.exit()
+
+        trunc_ret = ret % 256
+        if trunc_ret != ret:
+            logger.warning('Return value error code: %i.' % ret)
+        sys.exit(trunc_ret if trunc_ret > 0 else ERROR_RETVAL)
 
 
 if __name__ == "__main__":
-    if 'init' in sys.argv:
+    if sys.argv[-1] == 'init':
         try:
             from importlib import reload
         except ImportError:

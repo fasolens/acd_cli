@@ -4,26 +4,32 @@ import random
 import logging
 from threading import Lock, local
 
+from requests.exceptions import RequestException
+
 from .common import *
 
 logger = logging.getLogger(__name__)
-
-CONN_TIMEOUT = 30
-IDLE_TIMEOUT = 60
-REQUESTS_TIMEOUT = (CONN_TIMEOUT, IDLE_TIMEOUT) if requests.__version__ >= '2.4.0' else IDLE_TIMEOUT
 
 
 class BackOffRequest(object):
     """Wrapper for requests that implements timed back-off algorithm
     https://developer.amazon.com/public/apis/experience/cloud-drive/content/best-practices
     Caution: this catches all connection errors and may stall for a long time.
-    It is necessary to init this module before use.
-    """
+    It is necessary to init this module before use."""
 
-    def __init__(self, auth_callback):
+    def __init__(self, auth_callback: 'requests.auth.AuthBase', timeout: 'Tuple[int, int]', proxies: dict={}):
+        """:arg auth_callback: callable object that attaches auth info to a request
+           :arg timeout: tuple of connection timeout and idle timeout \
+                         (http://docs.python-requests.org/en/latest/user/advanced/#timeouts)
+           :arg proxies: dict of protocol to proxy, \
+                         see http://docs.python-requests.org/en/master/user/advanced/#proxies
+        """
+
         self.auth_callback = auth_callback
+        self.timeout = timeout if requests.__version__ >= '2.4.0' else timeout[1]
+        self.proxies = proxies
 
-        # __session = None
+        self.__session = requests.session()
         self.__thr_local = local()
         self.__lock = Lock()
         self.__retries = 0
@@ -59,15 +65,18 @@ class BackOffRequest(object):
             sleep(duration)
 
     @catch_conn_exception
-    def _request(self, type_, url: str, acc_codes: list, **kwargs) -> requests.Response:
-        # if not self.__session:
-        #     self.__session = requests.session()
+    def _request(self, type_: str, url: str, acc_codes: 'List[int]', **kwargs) -> requests.Response:
+        """Performs a HTTP request
+
+        :param type_: the type of HTTP request to perform
+        :param acc_codes: list of HTTP status codes that indicate a successful request
+        :param kwargs: may include additional header: dict and timeout: int"""
+
         self._wait()
 
-        with self.__lock:
-            headers = self.auth_callback()
+        headers = {}
         if 'headers' in kwargs:
-            headers = dict(headers, **(kwargs['headers']))
+            headers = dict(**(kwargs['headers']))
             del kwargs['headers']
 
         last_url = getattr(self.__thr_local, 'last_req_url', None)
@@ -84,13 +93,28 @@ class BackOffRequest(object):
             timeout = kwargs['timeout']
             del kwargs['timeout']
         else:
-            timeout = REQUESTS_TIMEOUT
+            timeout = self.timeout
 
+        r = None
+        exc = False
         try:
-            r = requests.request(type_, url, headers=headers, timeout=timeout, **kwargs)
+            try:
+                r = self.__session.request(type_, url, auth=self.auth_callback,
+                                           proxies=self.proxies, headers=headers, timeout=timeout,
+                                           **kwargs)
+            except RequestException as e:
+                r = e.request
+                raise
         except:
+            exc = True
             self._failed()
             raise
+        finally:
+            if r and 'x-amzn-RequestId' in r.headers:
+                if (exc or r.status_code not in acc_codes):
+                    logger.info('Failed x-amzn-RequestId: %s' % r.headers['x-amzn-RequestId'])
+                else:
+                    logger.debug('x-amzn-RequestId: %s' % r.headers['x-amzn-RequestId'])
 
         self._succeeded() if r.status_code in acc_codes else self._failed()
         return r
@@ -112,7 +136,7 @@ class BackOffRequest(object):
     def delete(self, url, acc_codes=OK_CODES, **kwargs) -> requests.Response:
         return self._request('DELETE', url, acc_codes, **kwargs)
 
-    def paginated_get(self, url: str, params: dict = None) -> list:
+    def paginated_get(self, url: str, params: dict = None) -> 'List[dict]':
         """Gets node list in segments of 200."""
         if params is None:
             params = {}

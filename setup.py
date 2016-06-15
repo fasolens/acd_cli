@@ -2,25 +2,28 @@ import os
 import re
 from setuptools import setup, find_packages
 from distutils.version import StrictVersion
+import acdcli
 
 
 def read(fname: str) -> str:
     return open(os.path.join(os.path.dirname(__file__), fname), encoding='utf-8').read()
 
+# replace GitHub external links
+repl = ('`([^`]*?) <(docs/)?(.*?)\.rst>`_',
+        '`\g<1> <https://acd-cli.readthedocs.org/en/latest/\g<3>.html>`_')
 
-version = re.search(r'^__version__\s*=\s*[\'"]([^\'"]*)[\'"]',
-                    read('acd_cli.py'), re.MULTILINE).group(1)
+version = acdcli.__version__
 StrictVersion(version)
 
 setup(
     name='acdcli',
     version=version,
     description='a command line interface and FUSE filesystem for Amazon Cloud Drive',
-    long_description=read('README.rst').replace('✅', '✓'),
+    long_description=re.sub(repl[0], repl[1], read('README.rst')),
     license='GPLv2+',
     author='yadayada',
     author_email='acd_cli@mail.com',
-    keywords='amazon cloud drive clouddrive',
+    keywords=['amazon cloud drive', 'clouddrive', 'FUSE'],
     url='https://github.com/yadayada/acd_cli',
     download_url='https://github.com/yadayada/acd_cli/tarball/' + version,
     zip_safe=False,
@@ -31,9 +34,10 @@ setup(
                   # 'acd_cli.plugins': ['stream = plugins.stream',
                   # 'template = plugins.template']
                   },
-    install_requires=['appdirs', 'python_dateutil', 'requests>=2.1.0', 'requests_toolbelt',
-                      'sqlalchemy'],
-    tests_require=['httpretty', 'mock'],
+    install_requires=['appdirs', 'colorama', 'fusepy', 'python_dateutil',
+                      'requests>=2.1.0,!=2.9.0', 'requests_toolbelt!=0.5.0'],
+    tests_require=['httpretty<0.8.11', 'mock'],
+    extras_require={'docs': ['sphinx_paramlinks']},
     classifiers=[
         'Environment :: Console',
         'License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)',

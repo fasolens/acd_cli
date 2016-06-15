@@ -1,7 +1,7 @@
 Contributing guidelines
 =======================
 
-Using the Issue tracker
+Using the Issue Tracker
 -----------------------
 
 The issue tracker is not a forum! This does not mean there is no need for good etiquette, but
@@ -11,39 +11,55 @@ sent to all of the issue's participants and some of them might consider it spam.
 For minor corrections or additions, try to update your posts rather than writing a new reply.
 Use strike-through markdown for corrections and put updates at the bottom of your original post.
 
-+1ing an issue or "me, too" replies will not get anything done faster.
+Please use the reaction button to "vote" on issues rather than commenting "+1" or similar.
 
 Adding Issues
 +++++++++++++
 
-Before adding an issue, check that you are using the latest master commit and there is no
-existing issue that fits your problem. Try to reproduce the issue on another machine or ideally on
-another operating system, if possible.
+If you have a question, please read the documentation and search the issue tracker.
+If you still have a question, please consider using the `Gitter chat 
+<https://gitter.im/yadayada/acd_cli>`_ or sending an e-mail to 
+`acd_cli@mail.com <mailto:acd_cli@mail.com>`_ instead of opening an issue.
 
-Please provide as much possibly relevant information as you can.
-You might find the ``--verbose`` and, to a lesser extent, ``--debug`` options helpful.
+If you absolutely must open an issue, check that you are using the latest master commit and
+there is no existing issue that fits your problem (including closed and unresolved issues).
+Try to reproduce the issue on another machine or ideally on another operating system, if possible.
+
+Please provide as much possibly relevant information as you can. This should at least contain:
+
+- your operating system and Python version, e.g. as determined by
+  :code:`python3 -c 'import platform as p; print("%s\n%s" % (p.python_version(), p.platform()))'`
+- the command/s you used
+- what happened
+- what you think should have happened instead (and maybe give a reason)
+
+You might find the ``--verbose`` and, to a lesser extent, ``--debug`` flags helpful.
+
+**Caution:** Be sure not to include authorization tokens from the log output in your comments.
 
 Use `code block markup <https://guides.github.com/features/mastering-markdown/>`_ for console
 output, log messages, etc.
 
-Questions may also be directed at `acd_cli@mail.com <mailto:acd_cli@mail.com>`_ or
-asked in the `chat <https://gitter.im/cloud-drive/acd_cli>`_.
-
 Code
 ----
 
-There are no real programming guidelines as of yet. Please use type hints like specified in PEP 0484
-where appropriate and limit line length to 100 characters.
+There are no real programming guidelines as of yet. Please use function annotations for typing
+like specified in PEP 3107 and, to stay 3.2-compliant, stringified `PEP 484 type hints
+<https://docs.python.org/3/library/typing.html>`_ where appropriate.
+The limit on line length is 100 characters.
 
-It is a generally a good idea to announce that you are working on an issue by explicitly stating
-this on the issue tracker.
+It is a generally a good idea to explicitly announce that you are working on a feature or 
+an issue.
 
-Please squash your commits before making a pull request.
+Please squash your commits and add yourself to the `contributors list <docs/contributors.rst>`_
+before making a pull request.
 
 Have a look at `Github's general guide how to contribute
 <https://guides.github.com/activities/contributing-to-open-source/#contributing>`_.
+It is not necessary to create a feature branch, i.e. you may commit to the master branch.
 
-There is also a `TODO <docs/TODO.rst>`_ list of some of the open tasks.
+If you do not know how to contribute, look for issues tagged with "help wanted" and read the
+`TODO list <docs/TODO.rst>`_ of some of the open tasks.
 
 Donations
 ---------

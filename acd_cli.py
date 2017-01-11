@@ -69,11 +69,12 @@ for path in paths:
 
 def_conf = ConfigParser()
 def_conf['download'] = dict(keep_corrupt=False, keep_incomplete=True)
+def_conf['upload'] = dict(timeout_wait=10)
 conf = None
 
 # consts
 
-MIN_AUTOSYNC_INTERVAL = 60
+MIN_SYNC_INTERVAL = 300
 MAX_LOG_SIZE = 10 * 2 ** 20
 MAX_LOG_FILES = 5
 
@@ -130,6 +131,14 @@ class CacheConsts(object):
 def sync_node_list(full=False, to_file=None, from_file=None) -> 'Union[int, None]':
     global cache
     cp_ = cache.KeyValueStorage.get(CacheConsts.CHECKPOINT_KEY) if not full else None
+    lst = cache.KeyValueStorage.get(CacheConsts.LAST_SYNC_KEY)
+    lst = float(lst) if lst else 0
+
+    wt = min(lst + MIN_SYNC_INTERVAL - time.time(), MIN_SYNC_INTERVAL)
+    if lst and wt > 0:
+        print('Last sync was very recent or has invalid date. Waiting %im %is.'
+              % (wt / 60, wt % 60))
+        time.sleep(wt)
 
     print('Getting changes', end='', flush=True)
 
@@ -197,12 +206,55 @@ def old_sync() -> 'Union[int, None]':
         files = acd_client.get_file_list()
         files.extend(acd_client.get_trashed_files())
     except RequestError as e:
+        logger.error(e)
         logger.critical('Sync failed.')
-        print(e)
         return ERROR_RETVAL
 
     cache.insert_nodes(files + folders, partial=False)
     cache.KeyValueStorage['sync_date'] = time.time()
+
+
+def partial_sync(path: str, recursive: bool) -> 'Union[int|None]':
+    path = '/' + '/'.join(list(filter(bool, path.split('/'))))
+    n = cache.resolve(path, trash=False)
+    fid = None
+
+    if n:
+        fid = n.id
+        n = acd_client.get_metadata(fid)
+        cache.insert_node(n)
+    else:
+        exc = None
+        try:
+            folder_chain = acd_client.resolve_folder_path(path)
+        except RequestError as e:
+            exc = e
+
+        if not folder_chain or exc:
+            if exc:
+                logger.error(e)
+            logger.critical('Could not resolve path "%s".' % path)
+            return INVALID_ARG_RETVAL
+
+        cache.insert_nodes(folder_chain)
+        fid = folder_chain[-1]['id']
+
+    try:
+        children = acd_client.list_children(fid)
+        if recursive:
+            recursive_insert(children)
+        else:
+            cache.insert_nodes(children)
+    except RequestError as e:
+        logger.error("Sync failed: %s" % e)
+        return ERROR_RETVAL
+
+
+def recursive_insert(nodes: 'List[dict]'):
+    cache.insert_nodes(nodes)
+    for n in nodes:
+        if n['kind'] == 'FOLDER':
+            recursive_insert(acd_client.list_children(n['id']))
 
 
 def autosync(interval: int, stop: Event = None):
@@ -213,7 +265,7 @@ def autosync(interval: int, stop: Event = None):
     if not interval:
         return
 
-    interval = max(MIN_AUTOSYNC_INTERVAL, interval)
+    interval = max(MIN_SYNC_INTERVAL, interval)
     while True:
         if stop.is_set():
             break
@@ -232,6 +284,7 @@ def autosync(interval: int, stop: Event = None):
 RetryRetVal = namedtuple('RetryRetVal', ['ret_val', 'retry'])
 STD_RETRY_RETVALS = [UL_DL_FAILED]
 DL_RETRY_RETVALS = [UL_DL_FAILED, HASH_MISMATCH]
+
 
 def retry_on(ret_vals: 'List[int]'):
     """Retry decorator that sets the wrapped function's progress handler argument according to its
@@ -308,7 +361,7 @@ def upload_complete(node: dict, path: str, hash_: str, size_: int, rsf: bool) ->
 
 
 def upload_timeout(parent_id: str, path: str, hash_: str, size_: int, rsf: bool) -> int:
-    minutes = 10
+    minutes = conf.getint('upload', 'timeout_wait')
     while minutes > 0:
         time.sleep(60)
         minutes -= 1
@@ -322,7 +375,7 @@ def upload_timeout(parent_id: str, path: str, hash_: str, size_: int, rsf: bool)
 
 
 def overwrite_timeout(initial_node: dict, path: str, hash_: str, size_: int, rsf: bool) -> int:
-    minutes = 10
+    minutes = conf.getint('upload', 'timeout_wait')
     while minutes > 0:
         time.sleep(60)
         minutes -= 1
@@ -521,13 +574,13 @@ def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: boo
     if not overwr and not force:
         logger.info('Skipping upload of existing file "%s".' % short_nm)
         pg_handler.done()
-        
+
         if not rsf:
             return 0
 
         if not compare_sizes(os.path.getsize(path), conflicting_node.size, short_nm):
             return remove_file(path)
-        
+
         logger.info('Keeping "%s" because of remote size mismatch.' % path)
         return 0
 
@@ -718,12 +771,24 @@ def no_autores_trash_action(func):
 # actual actions
 
 def sync_action(args: argparse.Namespace):
-    return sync_node_list(args.full, args.to_file, args.from_file)
+    ret = sync_node_list(args.full, args.to_file, args.from_file)
+    if cache.get_root_node() or args.to_file:
+        return ret
+    logger.error("Root node not found. Sync may have been incomplete.")
+    return ret if ret else 0 | ERROR_RETVAL
 
 
 def old_sync_action(args: argparse.Namespace):
     print('Syncing...')
     r = old_sync()
+    if not r:
+        print('Done.')
+    return r
+
+
+def partial_sync_action(args: argparse.Namespace):
+    print('Syncing...')
+    r = partial_sync(args.path, args.recursive)
     if not r:
         print('Done.')
     return r
@@ -746,9 +811,10 @@ def delete_everything_action(args: argparse.Namespace):
         print('Deleting directory failed.')
 
 
+@nocache_action
 @offline_action
 def clear_action(args: argparse.Namespace):
-    if not cache.drop_all():
+    if not db.NodeCache.remove_db_file(CACHE_PATH, SETTINGS_PATH):
         return ERROR_RETVAL
 
 
@@ -976,7 +1042,7 @@ def restore_action(args: argparse.Namespace) -> int:
 def resolve_action(args: argparse.Namespace) -> int:
     node = cache.resolve(args.path)
     if node:
-        print(node)
+        print(node.id)
     else:
         return INVALID_ARG_RETVAL
 
@@ -1085,7 +1151,8 @@ def mount_action(args: argparse.Namespace):
                           nothreads=args.single_threaded,
                           nonempty=args.nonempty, modules=args.modules,
                           umask=args.umask,gid=args.gid,uid=args.uid,
-                          allow_root=args.allow_root, allow_other=args.allow_other)
+                          allow_root=args.allow_root, allow_other=args.allow_other,
+                          volname=args.volname)
 
 
 @offline_action
@@ -1120,6 +1187,9 @@ def resolve_remote_path_args(args: argparse.Namespace, attrs: list, incl_trash: 
                 setattr(args, id_attr, v.id)
                 setattr(args, id_attr + '_path', val)
             elif is_valid_id(val):
+                if not cache.get_node(val):
+                    logger.critical('Cannot find node with ID "%s".' % val)
+                    sys.exit(INVALID_ARG_RETVAL)
                 setattr(args, id_attr + '_path', cache.first_path(val))
             else:
                 logger.critical('Invalid ID format: "%s".' % val)
@@ -1295,7 +1365,7 @@ def get_parser() -> tuple:
     vers_sp.set_defaults(func=print_version_action)
 
     sync_sp = subparsers.add_parser('sync', aliases=['s'],
-                                    help='[+] refresh node list cache; fetches complete node list '
+                                    help='[+] refresh node cache; fetches complete node list '
                                          'if the cache is empty or incremental changes '
                                          'if the cache is non-empty')
     sync_sp.add_argument('--full', '-f', action='store_true',
@@ -1308,6 +1378,12 @@ def get_parser() -> tuple:
 
     old_sync_sp = subparsers.add_parser('old-sync', add_help=False)
     old_sync_sp.set_defaults(func=old_sync_action)
+
+    psync_sp = subparsers.add_parser('psync', help='[+] only refresh the node cache for the '
+                                                   'specified folder [does not include trash]')
+    psync_sp.add_argument('--recursive', '-r', action='store_true')
+    psync_sp.add_argument('path')
+    psync_sp.set_defaults(func=partial_sync_action)
 
     clear_sp = subparsers.add_parser('clear-cache', aliases=['cc'],
                                      help='delete node cache file [offline operation]\n\n')
@@ -1507,6 +1583,7 @@ def get_parser() -> tuple:
     fuse_sp.add_argument('--nlinks', '-n', action='store_true', help='calculate nlinks')
     fuse_sp.add_argument('--interval', '-i', type=int, default=0,
                          help='sync every x seconds [turned off by default]')
+    fuse_sp.add_argument('--volname', '-vn', help='override volume name')
     fuse_sp.add_argument('path')
     fuse_sp.set_defaults(func=mount_action)
 
@@ -1556,11 +1633,13 @@ def main():
         logger.info(msg)
 
     logger.info('Settings path is "%s".' % SETTINGS_PATH)
-
-    conf = get_conf(SETTINGS_PATH, _SETTINGS_FILENAME, def_conf)
+    logger.info('Cache path is "%s".' % CACHE_PATH)
 
     global acd_client
     global cache
+    global conf
+
+    conf = get_conf(SETTINGS_PATH, _SETTINGS_FILENAME, def_conf)
 
     if args.func not in offline_actions:
         try:
@@ -1576,7 +1655,7 @@ def main():
             raise
             sys.exit(INIT_FAILED_RETVAL)
 
-        if args.func not in [sync_action, old_sync_action, clear_action]:
+        if args.func not in [sync_action, old_sync_action, partial_sync_action, clear_action]:
             if not check_cache():
                  sys.exit(INIT_FAILED_RETVAL)
             pass
@@ -1600,7 +1679,7 @@ def main():
 
         ret = args.func(args)
         if not ret:
-            sys.exit()
+            sys.exit(ret)
 
         trunc_ret = ret % 256
         if trunc_ret != ret:

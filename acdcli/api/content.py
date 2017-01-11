@@ -56,6 +56,7 @@ def _stream_is_empty(stream) -> bool:
                      'not contain at least one byte.')
         return False
 
+
 class ContentMixin(object):
     """Implements content portion of the ACD API."""
 
@@ -125,11 +126,8 @@ class ContentMixin(object):
         mime_type = _get_mimetype(basename)
         f = _tee_open(file_name, callbacks=read_callbacks)
 
-        # basename is ignored
         m = MultipartEncoder(fields=OrderedDict([('metadata', json.dumps(metadata)),
-                                                 (
-                                                     'content',
-                                                     (quote_plus(basename), f, mime_type))]))
+                                                 ('content', ('filename', f, mime_type))]))
 
         ok_codes = [http.CREATED]
         r = self.BOReq.post(self.content_url + 'nodes', params=params, data=m,
@@ -305,6 +303,12 @@ class ContentMixin(object):
 
         dl_chunk_sz = self._conf.getint('transfer', 'dl_chunk_size')
 
+        seekable = True
+        try:
+            file.tell()
+        except OSError:
+            seekable = False
+
         retries = 0
         while chunk_start < length:
             chunk_end = chunk_start + dl_chunk_sz - 1
@@ -341,7 +345,10 @@ class ContentMixin(object):
                         curr_ln += len(chunk)
             finally:
                 r.close()
-                chunk_start = file.tell()
+                if seekable:
+                    chunk_start = file.tell()
+                else:
+                    chunk_start = chunk_start + curr_ln
 
             retries = 0
 
